@@ -15,11 +15,12 @@ from dotenv import load_dotenv
 
 # Telegram & AI
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties # <-- التعديل هنا: استيراد الخصائص الافتراضية
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ErrorEvent
+# تم إضافة FSInputFile هنا لإرسال الصور
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ErrorEvent, FSInputFile 
 
 import google.generativeai as genai
 
@@ -50,7 +51,7 @@ BROWSER_TYPE_ENV = os.environ.get('BROWSER_TYPE', 'chromium')
 DASHBOARD_USER = os.environ.get('DASHBOARD_USER', 'admin')
 DASHBOARD_PASS = os.environ.get('DASHBOARD_PASS', 'admin123')
 
-# إعدادات Gemini (التعامل مع غياب المفتاح)
+# إعدادات Gemini
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 if GEMINI_API_KEY and GEMINI_API_KEY.strip():
     genai.configure(api_key=GEMINI_API_KEY)
@@ -58,7 +59,7 @@ if GEMINI_API_KEY and GEMINI_API_KEY.strip():
 else:
     AI_ENABLED = False
 
-# --- بداية الجزء الخاص بـ Sentry ---
+# Sentry Setup
 try:
     SENTRY_DSN = os.environ.get('SENTRY_DSN')
     if SENTRY_DSN:
@@ -72,9 +73,8 @@ try:
         print("⚠️ Sentry DSN not found, skipping initialization...")
 except Exception as e:
     print(f"❌ Failed to initialize Sentry: {e}")
-# --- نهاية الجزء الخاص بـ Sentry ---
 
-# إعدادات AWS S3
+# AWS S3
 S3_BUCKET = os.environ.get('S3_BUCKET_NAME')
 s3_client = boto3.client(
     's3',
@@ -89,7 +89,7 @@ LOCAL_MEDIA_DIR = "media"
 os.makedirs(LOCAL_MEDIA_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
-# مقاييس أداء Prometheus
+# Prometheus
 PROMETHEUS_TASKS_PROCESSED = Counter('tasks_processed_total', 'Total processed tasks')
 PROMETHEUS_TASKS_FAILED = Counter('tasks_failed_total', 'Total failed tasks')
 PROMETHEUS_QUEUE_SIZE = Gauge('tasks_queue_size', 'Current pending tasks in queue')
@@ -107,7 +107,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 logger.addFilter(PIIFilter())
 
-# <-- التعديل هنا: استخدام DefaultBotProperties لحل مشكلة الإصدار 3.7.0 وما فوق -->
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -178,6 +177,7 @@ async def init_db():
         ''')
         await db.execute("CREATE INDEX IF NOT EXISTS idx_status ON queue(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON queue(created_at)")
+        # إعادة تعيين المهام المعلقة عند إعادة التشغيل
         await db.execute("UPDATE queue SET status = 'pending' WHERE status = 'processing'")
         await db.commit()
     logger.info("🗄️ Database and indexes initialized.")
@@ -187,7 +187,7 @@ async def init_db():
 # ==========================================
 async def rewrite_with_gemini(text: str) -> str:
     if not AI_ENABLED:
-        return text # تجاوز مباشر وسريع إذا لم يتوفر المفتاح
+        return text
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = f"قم بإعادة صياغة طلب الدعم التالي ليكون احترافياً، واضحاً، ومباشراً وموجهاً لفريق دعم فني، دون إضافة معلومات غير موجودة في النص الأصلي:\n\n{text}"
@@ -379,18 +379,24 @@ async def run_playwright_task(task: dict):
             saved_path = await upload_media(temp_img, task['id'], "success")
             
             PROMETHEUS_TASKS_PROCESSED.inc()
-            return True, saved_path
+            # إرجاع مسار الصورة في حالة النجاح أيضاً
+            return True, "Task Completed", saved_path
             
     except Exception as e:
         logger.error(f"Task #{task['id']} failed: {e}")
         PROMETHEUS_TASKS_FAILED.inc()
+        error_img_path = None
         if page:
             try:
                 temp_err = f"temp_err_{task['id']}.png"
-                await page.screenshot(path=temp_err, full_page=True)
-                await upload_media(temp_err, task['id'], "error")
-            except: pass
-        return False, str(e)
+                # التقاط صورة الخطأ وتمرير مسارها للإرسال
+                await page.screenshot(path=temp_err, full_page=True, timeout=10000)
+                error_img_path = await upload_media(temp_err, task['id'], "error")
+            except Exception as pic_err: 
+                logger.error(f"Failed to capture screenshot: {pic_err}")
+        
+        # إرجاع الخطأ + مسار الصورة الملتقطة
+        return False, str(e), error_img_path
     finally:
         if page: await page.close()
         if context: await context.close()
@@ -404,11 +410,16 @@ async def browser_worker(worker_id: int):
         task = None
         async with aiosqlite.connect(DB_NAME) as db:
             db.row_factory = aiosqlite.Row
+            # حل مشكلة التزامن (Race Condition): التأكد من تحديث الحالة بأمان
             cursor = await db.execute("SELECT * FROM queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1")
-            task = await cursor.fetchone()
-            if task:
-                await db.execute("UPDATE queue SET status = 'processing' WHERE id = ?", (task['id'],))
-                await db.commit()
+            row = await cursor.fetchone()
+            if row:
+                update_cursor = await db.execute("UPDATE queue SET status = 'processing' WHERE id = ? AND status = 'pending'", (row['id'],))
+                if update_cursor.rowcount > 0:
+                    await db.commit()
+                    task = row
+                else:
+                    await db.rollback()
                 
         if task:
             task_dict = dict(task)
@@ -417,7 +428,7 @@ async def browser_worker(worker_id: int):
                 await bot.send_message(ADMIN_IDS[0], f"⚙️ بدء معالجة التذكرة #{task_dict['id']} (المنفذ {worker_id})...")
             except: pass
 
-            success, info = await run_playwright_task(task_dict)
+            success, info, img_path = await run_playwright_task(task_dict)
             
             async with aiosqlite.connect(DB_NAME) as db:
                 if success:
@@ -425,31 +436,39 @@ async def browser_worker(worker_id: int):
                     msg = f"✅ <b>تمت بنجاح: تذكرة #{task_dict['id']}</b>\nالمسار: {info}"
                 else:
                     new_retries = task_dict['retries'] + 1
+                    # تم إضافة الخطأ المبرمج لتتمكن من قراءته مباشرة
+                    error_text = str(info)[:500] 
                     if new_retries >= MAX_TASK_RETRIES:
                         await db.execute("UPDATE queue SET status = 'failed', retries = ? WHERE id = ?", (new_retries, task_dict['id']))
-                        msg = f"❌ <b>فشل نهائي: تذكرة #{task_dict['id']}</b>\nالسبب: {info}"
+                        msg = f"❌ <b>فشل نهائي: تذكرة #{task_dict['id']}</b>\nالخطأ: <code>{error_text}</code>"
                     else:
                         await db.execute("UPDATE queue SET status = 'pending', retries = ? WHERE id = ?", (new_retries, task_dict['id']))
-                        msg = f"⚠️ <b>تأجيل: تذكرة #{task_dict['id']}</b> سيتم إعادة المحاولة (المحاولة {new_retries})."
+                        msg = f"⚠️ <b>تأجيل: تذكرة #{task_dict['id']}</b> سيتم إعادة المحاولة (المحاولة {new_retries}).\nالخطأ: <code>{error_text}</code>"
                 await db.commit()
                 
                 cursor = await db.execute("SELECT COUNT(*) FROM queue WHERE status = 'pending'")
                 PROMETHEUS_QUEUE_SIZE.set((await cursor.fetchone())[0])
 
-            try:
-                await bot.send_message(ADMIN_IDS[0], msg)
-            except: pass
+            # إرسال الصورة للمسؤولين
+            for admin_id in ADMIN_IDS:
+                try:
+                    if img_path and not img_path.startswith("S3:"):
+                        photo = FSInputFile(img_path)
+                        await bot.send_photo(admin_id, photo=photo, caption=msg)
+                    else:
+                        text_to_send = f"{msg}\n\nرابط الصورة: {img_path}" if img_path else msg
+                        await bot.send_message(admin_id, text_to_send)
+                except Exception as e:
+                    logger.error(f"Failed to send alert to admin {admin_id}: {e}")
         else:
             await asyncio.sleep(2)
 
 async def system_maintenance_worker():
     while True:
         try:
-            # 1. النسخ الاحتياطي (Automated Backups)
             backup_file = os.path.join(BACKUP_DIR, f"db_backup_{datetime.now().strftime('%Y%m%d')}.sqlite")
             shutil.copy2(DB_NAME, backup_file)
             
-            # 2. تنظيف البيانات (Data Cleanup - Retain 7 days)
             async with aiosqlite.connect(DB_NAME) as db:
                 seven_days_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
                 await db.execute("DELETE FROM queue WHERE status IN ('completed', 'failed') AND created_at < ?", (seven_days_ago,))
@@ -462,9 +481,8 @@ async def system_maintenance_worker():
         await asyncio.sleep(86400)
 
 async def daily_report_worker():
-    """عامل لإرسال تقارير يومية للمسؤولين"""
     while True:
-        await asyncio.sleep(86400) # كل 24 ساعة
+        await asyncio.sleep(86400)
         try:
             async with aiosqlite.connect(DB_NAME) as db:
                 cursor = await db.execute("SELECT status, COUNT(*) FROM queue GROUP BY status")
@@ -485,7 +503,6 @@ async def daily_report_worker():
 # ==========================================
 @web.middleware
 async def auth_middleware(request, handler):
-    """حماية واجهة الويب بكلمة مرور (Basic Auth)"""
     if request.path == '/':
         auth_header = request.headers.get('Authorization')
         expected_auth = f"Basic {base64.b64encode(f'{DASHBOARD_USER}:{DASHBOARD_PASS}'.encode('utf-8')).decode('utf-8')}"
